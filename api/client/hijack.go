@@ -9,7 +9,9 @@ import (
 	"net/http/httputil"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dotcloud/docker/api"
 	"github.com/dotcloud/docker/dockerversion"
@@ -87,6 +89,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 				}
 			}()
 
+			utils.Debugf("[hijack] about to copy")
 			// When TTY is ON, use regular copy
 			if setRawTerminal {
 				_, err = io.Copy(stdout, br)
@@ -103,6 +106,15 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 			io.Copy(rwc, in)
 			utils.Debugf("[hijack] End of stdin")
 		}
+		var delay string
+		delay = os.Getenv("DOCKER_CLOSE_DELAY")
+		if delay != "" {
+			if nsDelay, err := strconv.ParseInt(delay, 10, 64); err == nil {
+				utils.Debugf("[hijack] about to delay ms: %d", nsDelay)
+				time.Sleep(time.Duration(nsDelay) * time.Millisecond)
+			}
+		}
+		utils.Debugf("[hijack] About to close")
 		if tcpc, ok := rwc.(*net.TCPConn); ok {
 			if os.Getenv("DOCKER_DO_NOT_CLOSE_WRITE") == "" {
 				if err := tcpc.CloseWrite(); err != nil {
@@ -116,6 +128,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 				utils.Debugf("Couldn't send EOF: %s\n", err)
 			}
 		}
+		utils.Debugf("[hijack] After close")
 		// Discard errors due to pipe interruption
 		return nil
 	})
