@@ -1,15 +1,16 @@
 package client
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,100 @@ import (
 	"github.com/dotcloud/docker/pkg/term"
 	"github.com/dotcloud/docker/utils"
 )
+
+type ConnCloser interface {
+	CloseWrite() error
+	SetReadDeadline(t time.Time) error
+}
+
+type result struct {
+	nr  int
+	err error
+}
+
+type hijackedConn struct {
+	conn         *ConnCloser
+	reader       *bufio.Reader
+	readyToRead  chan *[]byte
+	readResult   chan result
+	readyToClose chan bool
+	closeResult  chan error
+}
+
+func (hc *hijackedConn) Read(p []byte) (n int, err error) {
+	var (
+		r result
+	)
+	hc.readyToRead <- &p
+	r = <-hc.readResult
+	return r.nr, r.err
+}
+
+func (hc *hijackedConn) CloseWrite() error {
+	hc.readyToClose <- true
+	return <-hc.closeResult
+}
+
+func (hc *hijackedConn) SetReadDeadline(t time.Time) error {
+	return (*(hc.conn)).SetReadDeadline(t)
+}
+
+func NewHijackedConn(conn net.Conn, reader *bufio.Reader) *hijackedConn {
+	var (
+		hc     *hijackedConn
+		closer ConnCloser
+	)
+	closer, ok := conn.(ConnCloser)
+	if !ok {
+		log.Fatal("failed to cast connection")
+	}
+
+	hc = &hijackedConn{&closer, reader, make(chan *[]byte, 1), make(chan result), make(chan bool), make(chan error)}
+	go func(readyToRead chan *[]byte, readyToClose <-chan bool, readResult chan<- result, closeResult chan<- error) {
+		var (
+			eof    bool
+			closed bool
+			buffer *[]byte
+		)
+		eof = false
+		closed = false
+
+		for !eof || !closed {
+			utils.Debugf("[sync] About to select")
+			select {
+			case buffer = <-readyToRead:
+				utils.Debugf("[sync] About to read")
+				if !closed {
+					// once we have closed the write channel we can read with maximum efficiency
+					hc.SetReadDeadline(time.Now().Add(time.Duration(500 * time.Millisecond)))
+				} else {
+					hc.SetReadDeadline(time.Unix(0, 0))
+				}
+				bytesRead, err := hc.reader.Read(*buffer)
+				utils.Debugf("[sync] after read %d, %+v", bytesRead, err)
+				eof = eof || err == io.EOF
+				if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+					if bytesRead == 0 {
+						utils.Debugf("[sync] read timed out - trying again")
+						readyToRead <- buffer
+						continue
+					} else {
+						err = nil
+					}
+				}
+				readResult <- result{bytesRead, err}
+			case <-readyToClose:
+				utils.Debugf("[sync] about to close")
+				closeResult <- closer.CloseWrite()
+				utils.Debugf("[sync] closed")
+				closed = true
+			}
+		}
+
+		utils.Debugf("[sync] about to exit")
+	}(hc.readyToRead, hc.readyToClose, hc.readResult, hc.closeResult)
+	return hc
+}
 
 func (cli *DockerCli) dial() (net.Conn, error) {
 	if cli.tlsConfig != nil && cli.proto != "unix" {
@@ -54,7 +149,9 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 	// Server hijacks the connection, error 'connection closed' expected
 	clientconn.Do(req)
 
+	var hc *hijackedConn
 	rwc, br := clientconn.Hijack()
+	hc = NewHijackedConn(rwc, br)
 	defer rwc.Close()
 
 	if started != nil {
@@ -94,7 +191,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 			if setRawTerminal {
 				_, err = io.Copy(stdout, br)
 			} else {
-				_, err = utils.StdCopy(stdout, stderr, br)
+				_, err = utils.StdCopy(stdout, stderr, hc)
 			}
 			utils.Debugf("[hijack] End of stdout")
 			return err
@@ -106,28 +203,8 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 			io.Copy(rwc, in)
 			utils.Debugf("[hijack] End of stdin")
 		}
-		var delay string
-		delay = os.Getenv("DOCKER_CLOSE_DELAY")
-		if delay != "" {
-			if nsDelay, err := strconv.ParseInt(delay, 10, 64); err == nil {
-				utils.Debugf("[hijack] about to delay ms: %d", nsDelay)
-				time.Sleep(time.Duration(nsDelay) * time.Millisecond)
-			}
-		}
 		utils.Debugf("[hijack] About to close")
-		if tcpc, ok := rwc.(*net.TCPConn); ok {
-			if os.Getenv("DOCKER_DO_NOT_CLOSE_WRITE") == "" {
-				if err := tcpc.CloseWrite(); err != nil {
-					utils.Debugf("Couldn't send EOF: %s\n", err)
-				}
-			} else {
-				utils.Debugf("[hijack] Skipped CloseWrite")
-			}
-		} else if unixc, ok := rwc.(*net.UnixConn); ok {
-			if err := unixc.CloseWrite(); err != nil {
-				utils.Debugf("Couldn't send EOF: %s\n", err)
-			}
-		}
+		hc.CloseWrite()
 		utils.Debugf("[hijack] After close")
 		// Discard errors due to pipe interruption
 		return nil
